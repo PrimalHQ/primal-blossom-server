@@ -5,5 +5,7 @@
 
 ### Usage
 
-    nix develop -c sh -c 'RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json'
+Create Postgres database, edit `primal-blossom-server-config.json` to match your database settings, and run the following command:
+
+    nix develop -c sh -c 'DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json'
 
