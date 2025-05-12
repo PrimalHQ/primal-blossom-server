@@ -1,0 +1,42 @@
+[package]
+name = "primal_blossom_server"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["media-processing"]
+media-processing = []
+
+[dependencies]
+axum = { version = "0.6", features = ["multipart"] }
+tokio = { version = "1.28", features = ["full"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "macros", "time", "uuid"] }
+hex = "0.4"
+anyhow = "1.0.98"
+socket2 = "0.5.9"
+chrono = "0.4.41"
+hyper = { version = "1.6.0", features = ["full"] }
+sha2 = "0.10.9"
+once_cell = "1.21.3"
+tempfile = "3.19.1"
+which = "7.0.3"
+dashmap = "6.1.0"
+nostr-sdk = "0.41"
+serde_json = { version = "1.0.140", features = ["preserve_order"] }
+base64 = "0.22.1"
+reqwest = { version = "0.12.15", default-features = false, features = ["socks", "rustls-tls"] }
+clap = { version = "4.5.37", features = ["derive"] }
+tower-http = { version = "0.3", features = ["trace", "map-response-body"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+env_logger = "0.11.8"
+
+futures = "0.3"
+
+aws-sdk-s3 = "1.84.0"
+aws-config = "1.6.2"
+aws-types = "1.3.7"
+aws-smithy-http = "0.62.1"
+serde = "1.0.219"
+
