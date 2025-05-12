@@ -1,0 +1,14 @@
+{
+    "port": 8181,
+    "cache_database_url": "postgresql://user@127.0.0.1:5432/blossom?application_name=blossom-server",
+    "membership_database_url": "postgresql://user@127.0.0.1:5432/blossom?application_name=blossom-server",
+    "base_url": "https://blossom.example.com",
+    "media_server_url": "https://media.example.com",
+    "proxy": "socks5://127.0.0.1:1080",
+    "binary_data_cache_dir": "/tmp/procgraph",
+    "local_storages": {
+        "st1": "/mnt/st1/var/www",
+        "st2": "/mnt/st2/var/www"
+    },
+    "sandboxing": true
+}
