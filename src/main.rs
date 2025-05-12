@@ -51,6 +51,7 @@ async fn my_main(config: Config, state: State) -> anyhow::Result<()> {
     }
 
     let port = config.port;
+    let cache = state.cache.clone();
 
     // tracing_subscriber::registry()
     //     // .with(EnvFilter::from_default_env())  // e.g. set RUST_LOG=info in your env
@@ -79,10 +80,11 @@ async fn my_main(config: Config, state: State) -> anyhow::Result<()> {
     socket.listen(1024)?;
     let std_listener: std::net::TcpListener = socket.into();
 
-    tokio::spawn(async {
+    tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            primal_blossom_server::CACHE.clear();
+            log!("cache size before clear: {}", cache.len());
+            cache.clear();
             // log!("cache cleared");
         }
     });

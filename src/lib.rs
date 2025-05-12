@@ -12,6 +12,7 @@ pub use axum::{
 
 pub use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 pub use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+pub use std::sync::Arc;
 
 pub use std::env;
 
@@ -30,6 +31,8 @@ pub use serde_json::Value;
 pub use serde_json::json;
 
 pub use clap::Parser;
+
+pub use dashmap::DashMap;
 
 // ------------------ log ---------------------
 
@@ -120,6 +123,7 @@ pub struct State {
     pub membership_pool: PgPool,
     pub exiftool_path: OsString,
     pub ffmpeg_path: OsString,
+    pub cache: Arc<DashMap<Vec<u8>, Option<Upload>>>,
 }
 
 use std::future::Future;
@@ -146,6 +150,7 @@ where
             .connect(&config.membership_database_url).await?,
         exiftool_path: OsString::from(which::which("exiftool").unwrap().to_string_lossy().into_owned()),
         ffmpeg_path: OsString::from(which::which("ffmpeg").unwrap().to_string_lossy().into_owned()),
+        cache: Arc::new(DashMap::new()),
     };
 
     my_main(config, state).await
@@ -172,10 +177,10 @@ pub struct BlobRecord {
     size: i64,
 }
 
-pub async fn extract_blob_record(path: &str, pool: &sqlx::PgPool) -> Result<Option<BlobRecord>, (StatusCode, String)> {
+pub async fn extract_blob_record(state: &State, path: &str) -> Result<Option<BlobRecord>, (StatusCode, String)> {
     let sha256 = parse_sha256_from_path(path)?;
 
-    let b = find_blob(pool, sha256).await?;
+    let b = find_blob(state, sha256).await?;
 
     if let Some(b) = b {
         return Ok(Some(BlobRecord {
@@ -339,7 +344,7 @@ pub async fn head_handler(
 
         Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![]))
     } else {
-        if let Some(r) = extract_blob_record(&path, &state.cache_pool).await? {
+        if let Some(r) = extract_blob_record(&state, &path).await? {
             Ok(make_response(StatusCode::OK, r.content_type.as_str(), "", vec![
                     (header::CONTENT_LENGTH.as_str(), &r.size.to_string().as_str()),
             ]))
@@ -397,7 +402,7 @@ pub async fn get_handler(
                 vec![]))
 
     } else {
-        let rec = extract_blob_record(&path, &state.cache_pool).await?;
+        let rec = extract_blob_record(&state, &path).await?;
 
         if let Some(r) = rec {
             Ok(Response::builder()
@@ -425,7 +430,7 @@ pub async fn delete_handler(
     
     let sha256 = parse_sha256_from_path(path.as_str())?;
 
-    let b = find_blob(&state.cache_pool, sha256.clone()).await?;
+    let b = find_blob(&state, sha256.clone()).await?;
 
     if let Some(b) = b {
         let e = check_action(&headers, "delete", Some(b.sha256))?;
@@ -443,49 +448,48 @@ pub async fn delete_handler(
             sha256,
             &e.pubkey.to_bytes(),
         ).fetch_optional(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
-            #[cfg(feature = "media-processing")]
-            {
-                let blossom_url = format!("{}/{}", config.base_url, path);
-                let nid = schedule_processing_node(
-                    &state, 
-                    "PrimalServer.InternalServices", 
-                    "purge_media_",
-                    json!({
-                        "_ty": "Tuple",
-                        "_v": [
-                        {"_ty": "PubKeyId", "_v": e.pubkey.to_hex()},
-                        blossom_url,
-                        ],
-                    }), 
-                    json!({
-                        "extra": {
-                            "_ty": "NamedTuple",
-                            "_v": {
-                                "initiator_pubkey": {
-                                    "_ty": "PubKeyId",
-                                    "_v": e.pubkey.to_hex()
+            cfg_if::cfg_if! {
+                if #[cfg(feature = "media-processing")] {
+                    let blossom_url = format!("{}/{}", config.base_url, path);
+                    let nid = schedule_processing_node(
+                        &state, 
+                        "PrimalServer.InternalServices", 
+                        "purge_media_",
+                        json!({
+                            "_ty": "Tuple",
+                            "_v": [
+                            {"_ty": "PubKeyId", "_v": e.pubkey.to_hex()},
+                            blossom_url,
+                            ],
+                        }), 
+                        json!({
+                            "extra": {
+                                "_ty": "NamedTuple",
+                                "_v": {
+                                    "initiator_pubkey": {
+                                        "_ty": "PubKeyId",
+                                        "_v": e.pubkey.to_hex()
+                                    }
                                 }
-                            }
-                        },
-                        "reason": format!("delete from {}", config.base_url),
-                    }),
-                    ).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "purge_media_ failed".to_string()))?;
+                            },
+                            "reason": format!("delete from {}", config.base_url),
+                        }),
+                        ).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "purge_media_ failed".to_string()))?;
 
-                wait_processing_node(&state, nid).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "wait_processing_node failed".to_string()))?;
-            }
-            #[cfg(not(feature = "media-processing"))]
-            {
-                let mut tx = state.membership_pool.begin().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
-                let ulpkcnt  = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1 and pubkey = $2"#, sha256, &e.pubkey.to_bytes()).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
-                let ulallcnt = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1"#, sha256).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
-                match (ulpkcnt, ulallcnt) {
-                    (Some(ulpkcnt), Some(ulallcnt)) if ulpkcnt != 0 && ulpkcnt == ulallcnt => {
-                        sqlx::query!(r#"DELETE FROM media_uploads WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
-                        sqlx::query!(r#"DELETE FROM media_storage WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                    wait_processing_node(&state, nid).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "wait_processing_node failed".to_string()))?;
+                } else {
+                    let mut tx = state.membership_pool.begin().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                    let ulpkcnt  = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1 and pubkey = $2"#, sha256, &e.pubkey.to_bytes()).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
+                    let ulallcnt = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1"#, sha256).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
+                    match (ulpkcnt, ulallcnt) {
+                        (Some(ulpkcnt), Some(ulallcnt)) if ulpkcnt != 0 && ulpkcnt == ulallcnt => {
+                            sqlx::query!(r#"DELETE FROM media_uploads WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                            sqlx::query!(r#"DELETE FROM media_storage WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                        }
+                        _ => { }
                     }
-                    _ => { }
+                    tx.commit().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
                 }
-                tx.commit().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
             }
 
             return Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![]))
@@ -651,6 +655,8 @@ pub async fn import_blob(e: &Event, data: &Vec<u8>, config: &Config, state: &Sta
         None::<sqlx::types::Uuid>, // media_block_id
     ).execute(&state.membership_pool).await.map_log_err("db error".to_string())?;
 
+    state.cache.remove(&sha256);
+
     let blossom_url = format!("{}/{}{}", config.base_url, sha256_hex, ext);
 
     Ok((
@@ -673,16 +679,11 @@ pub struct Upload {
     pub size:      i64,
 }
 
-pub use dashmap::DashMap;
-pub static CACHE: Lazy<DashMap<Vec<u8>, Option<Upload>>> = Lazy::new(|| {
-    DashMap::new()
-});
-
 pub async fn find_blob(
-    pool: &sqlx::PgPool,
+    state: &State,
     sha256: Vec<u8>,
 ) -> Result<Option<Upload>, (StatusCode, String)> {
-    if let Some(entry) = CACHE.get(&sha256) {
+    if let Some(entry) = state.cache.get(&sha256) {
         // log!("cache hit for {sha256}");
         return Ok(entry.clone());
     }
@@ -703,7 +704,7 @@ pub async fn find_blob(
          LIMIT 1
         "#,
         sha256,
-    ).fetch_optional(pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+    ).fetch_optional(&state.cache_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
 
     let result = match r {
         Some(r) => match r.sha256 {
@@ -721,7 +722,7 @@ pub async fn find_blob(
         None => None,
     };
 
-    CACHE.insert(sha256, result.clone());
+    state.cache.insert(sha256, result.clone());
 
     Ok(result)
 }
