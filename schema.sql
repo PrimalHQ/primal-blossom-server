@@ -57,3 +57,10 @@ create table if not exists media_metadata_stripping
 create index if not exists media_metadata_stripping_sha256_before_idx on media_metadata_stripping (sha256_before);
 create index if not exists media_metadata_stripping_sha256_after_idx on media_metadata_stripping (sha256_after);
 
+create table if not exists media_storage_priority
+(
+    storage_provider varchar not null,
+    priority         integer not null,
+    primary key (storage_provider)
+);
+
