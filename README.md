@@ -21,7 +21,7 @@ A Nostr-based media server implementing Blossom protocol [https://github.com/hzr
 
 ```mermaid
 graph TD
-    A[Client] -->|Nostr Event Auth & Media Files| B(Server)
+    A[Client] -->|Nostr Event Auth & Media Files| B(Primal Blossom Server)
     B -->|DB Storage| C[PostgreSQL]
     B -->|Media Files| D[Local Storage]
     B -.->|Advanced Media Processing| E[Processing Nodes]
@@ -51,7 +51,7 @@ INSERT INTO media_storage_priority VALUES ('st1', 1000); -- should match local s
 - Run the following command:
 
 ```bash
-nix develop -c sh -c 'DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json'
+nix develop -c sh -c '$rustup_init; DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json'
 ```
 
 ## API Endpoints
