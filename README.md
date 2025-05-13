@@ -21,10 +21,10 @@ A Nostr-based media server implementing Blossom protocol [https://github.com/hzr
 
 ```mermaid
 graph TD
-    A[Client] -->|Nostr Event Auth| B(Server)
+    A[Client] -->|Nostr Event Auth & Media Files| B(Server)
     B -->|DB Storage| C[PostgreSQL]
     B -->|Media Files| D[Local Storage]
-    B --> E[Processing Nodes]
+    B -.->|Advanced Media Processing| E[Processing Nodes]
     E --> F[S3/CDN]
 ```
 
@@ -91,8 +91,6 @@ Content-Type: application/json
 ### Download
 ```
 GET /<sha256>
-```
-```
 GET /<sha256>.<ext>
 ```
 
