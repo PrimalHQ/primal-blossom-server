@@ -481,12 +481,11 @@ pub async fn delete_handler(
                     let mut tx = state.membership_pool.begin().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
                     let ulpkcnt  = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1 and pubkey = $2"#, sha256, &e.pubkey.to_bytes()).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
                     let ulallcnt = sqlx::query!(r#"select count(1) as cnt from media_uploads where sha256 = $1"#, sha256).fetch_one(&mut *tx).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?.cnt;
-                    match (ulpkcnt, ulallcnt) {
-                        (Some(ulpkcnt), Some(ulallcnt)) if ulpkcnt != 0 && ulpkcnt == ulallcnt => {
-                            sqlx::query!(r#"DELETE FROM media_uploads WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                    sqlx::query!(r#"DELETE FROM media_uploads WHERE sha256 = $1 and pubkey = $2"#, sha256, &e.pubkey.to_bytes()).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+                    if let (Some(ulpkcnt), Some(ulallcnt)) = (ulpkcnt, ulallcnt) {
+                        if ulpkcnt != 0 && ulpkcnt == ulallcnt {
                             sqlx::query!(r#"DELETE FROM media_storage WHERE sha256 = $1"#, sha256).execute(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
                         }
-                        _ => { }
                     }
                     tx.commit().await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
                 }
@@ -913,6 +912,7 @@ pub async fn cache_data(
     Ok(sha256)
 }
 
+#[cfg(feature = "media-processing")]
 pub async fn schedule_processing_node(
     state: &State,
     module: &str,
@@ -946,6 +946,7 @@ pub async fn schedule_processing_node(
     Ok(id)
 }
 
+#[cfg(feature = "media-processing")]
 pub async fn schedule_media_processing(
     config: &Config, state: &State,
     pubkey: PublicKey,
@@ -971,6 +972,7 @@ pub async fn schedule_media_processing(
     ).await
 }
 
+#[cfg(feature = "media-processing")]
 pub async fn wait_processing_node(
     state: &State,
     node_id: Vec<u8>,
