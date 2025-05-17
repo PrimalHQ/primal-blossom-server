@@ -84,7 +84,7 @@ X-SHA-256: <sha256sum>
 Content-Type: application/json
 
 {
-  "url": "https://blossom.example.net/HASH.jpg"
+  "url": "https://blossom.example.net/SHA256.jpg"
 }
 ```
 
@@ -97,6 +97,7 @@ GET /<sha256>.<ext>
 ### Listing User Uploads
 ```
 GET /list/<pubkey>
+Authorization: Nostr <base64-encoded-auth-event>
 ```
 
 ### Deletion
