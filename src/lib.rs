@@ -1,3 +1,4 @@
+use axum::extract::Query;
 pub use axum::{
     extract::{Extension, Path},
     http::{header, Response, StatusCode},
@@ -371,53 +372,69 @@ pub async fn get_handler(
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("GET {path} | {}", get_user_agent(&headers));
     
-    if path == "" {
-        Ok(make_response(StatusCode::OK, "text/plain", "Welcome to Primal Blossom server. Implemented: BUD-01, BUD-02, BUD-04, BUD-05", vec![]))
+    let rec = extract_blob_record(&state, &path).await?;
 
-    } else if path.starts_with("list/") {
-        let ps = path.split('/').collect::<Vec<_>>();
-        let pk = PublicKey::parse(ps[1]).map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
-        let mut res = vec![];
-        for r in sqlx::query!(
-            r#"
-            SELECT mimetype, created_at, path, size, sha256
-              FROM media_uploads
-             WHERE pubkey = $1
-               AND media_block_id IS null
-            "#,
-            &pk.to_bytes(),
-        ).fetch_all(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
-            let ext = MIMETYPE_EXT.get(&r.mimetype.as_str()).unwrap_or(&"");
-            let sha256_hex = hex::encode(&r.sha256.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "invalid sha256".to_string()))?);
-            res.push(json!({
-                        "url": format!("{}/{}{}", config.base_url, sha256_hex, ext),
-                        "sha256": sha256_hex,
-                        "size": r.size,
-                        "type": r.mimetype,
-                        "uploaded": r.created_at,
-            }));
-        }
-        Ok(make_response(StatusCode::OK, "application/json", 
-                serde_json::to_string(&res).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
-                vec![]))
-
+    if let Some(r) = rec {
+        Ok(Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, r.media_url)
+            .header(header::CONTENT_TYPE, r.content_type)
+            .header("Access-Control-Allow-Methods", "*")
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Headers", "*")
+            .body(axum::body::Body::empty())
+            .unwrap())
     } else {
-        let rec = extract_blob_record(&state, &path).await?;
-
-        if let Some(r) = rec {
-            Ok(Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::LOCATION, r.media_url)
-                .header(header::CONTENT_TYPE, r.content_type)
-                .header("Access-Control-Allow-Methods", "*")
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Allow-Headers", "*")
-                .body(axum::body::Body::empty())
-                .unwrap())
-        } else {
-            Err((StatusCode::NOT_FOUND, "not found".to_string()))
-        }
+        Err((StatusCode::NOT_FOUND, "not found".to_string()))
     }
+}
+
+pub async fn get_list_handler(
+    headers: axum::http::HeaderMap,
+    Extension(config): Extension<Config>,
+    Extension(state): Extension<State>,
+    Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
+    log!("GET /list/{path} | {}", get_user_agent(&headers));
+    
+    let pk = PublicKey::parse(&path).map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
+    let e = check_action(&headers, "list", None)?;
+    
+    if e.pubkey != pk {
+        return Err((StatusCode::UNAUTHORIZED, "invalid pubkey".to_string()));
+    }
+
+    let since = params.get("since").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let until = params.get("until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(chrono::Utc::now().timestamp());
+
+    let mut res = vec![];
+    for r in sqlx::query!(
+        r#"
+        SELECT mimetype, created_at, path, size, sha256
+          FROM media_uploads
+         WHERE pubkey = $1
+           AND created_at >= $2
+           AND created_at <= $3
+           AND media_block_id IS null
+        "#,
+        &pk.to_bytes(),
+        since,
+        until,
+    ).fetch_all(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
+        let ext = MIMETYPE_EXT.get(&r.mimetype.as_str()).unwrap_or(&"");
+        let sha256_hex = hex::encode(&r.sha256.ok_or((StatusCode::INTERNAL_SERVER_ERROR, "invalid sha256".to_string()))?);
+        res.push(json!({
+                    "url": format!("{}/{}{}", config.base_url, sha256_hex, ext),
+                    "sha256": sha256_hex,
+                    "size": r.size,
+                    "type": r.mimetype,
+                    "uploaded": r.created_at,
+        }));
+    }
+    Ok(make_response(StatusCode::OK, "application/json", 
+            serde_json::to_string(&res).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
+            vec![]))
 }
 
 pub async fn delete_handler(

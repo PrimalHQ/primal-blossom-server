@@ -24,6 +24,7 @@ use primal_blossom_server::{
     get_handler,
     put_handler,
     delete_handler,
+    get_list_handler,
     Extension,
     Router,
     Config,
@@ -63,6 +64,7 @@ async fn my_main(config: Config, state: State) -> anyhow::Result<()> {
         .route("/", get(welcome_page_handler))
         .route("/:path", options(options_handler).head(head_handler).get(get_handler).delete(delete_handler))
         .route("/:path", put(put_handler).layer(DefaultBodyLimit::max(10*1024*1024*1024)))
+        .route("/list/:path", options(options_handler).head(head_handler).get(get_list_handler))
         .layer(Extension(config))
         .layer(Extension(state))
         // .layer(TraceLayer::new_for_http()
