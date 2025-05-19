@@ -31,7 +31,7 @@ pub use nostr_sdk::prelude::{PublicKey, Event, JsonUtil};
 pub use serde_json::Value;
 pub use serde_json::json;
 
-pub use clap::Parser;
+pub use clap::{Parser, Subcommand};
 
 pub use dashmap::DashMap;
 
@@ -81,7 +81,7 @@ pub trait ResultLogErr<T, E, R> {
 
 impl<T, E, R> ResultLogErr<T, E, R> for Result<T, E>
 where
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + std::fmt::Display,
     R: std::clone::Clone
 {
     fn map_log_err(self, r: R) -> Result<T, R> {
@@ -99,6 +99,19 @@ where
 pub struct Cli {
     #[arg(long)]
     pub config_file: Option<String>,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    #[command(about = "start the server")]
+    Serve {
+    },
+    #[command(about = "strip metadata")]
+    Strip {
+    },
 }
 
 // ------------------ main ---------------------
@@ -116,6 +129,7 @@ pub struct Config {
     pub membership_database_url: String,
     pub local_storages: HashMap<String, String>,
     pub sandboxing: bool,
+    pub tempdir: String,
 }
 
 #[derive(Debug,Clone)]
@@ -131,12 +145,12 @@ use std::future::Future;
 
 pub async fn main_1<H, Fut>(my_main: H) -> anyhow::Result<()>
 where
-  H: Fn(Config, State) -> Fut + Send + Sync + 'static,
+  H: Fn(Config, State, Cli) -> Fut + Send + Sync + 'static,
   Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let cli = Cli::parse();
 
-    let config_file = cli.config_file.or(env::var("CONFIG_FILE").ok()).expect("config file is required");
+    let config_file = cli.config_file.clone().or(env::var("CONFIG_FILE").ok()).expect("config file is required");
     let config_str = tokio::fs::read_to_string(config_file).await.expect("config file read error");
     let config: Config = serde_json::from_str(&config_str).expect("config file parse error");
 
@@ -149,12 +163,18 @@ where
             .max_connections(10)
             .min_connections(1)
             .connect(&config.membership_database_url).await?,
-        exiftool_path: OsString::from(which::which("exiftool").unwrap().to_string_lossy().into_owned()),
-        ffmpeg_path: OsString::from(which::which("ffmpeg").unwrap().to_string_lossy().into_owned()),
+        exiftool_path: get_program_path("exiftool").await,
+        ffmpeg_path:   get_program_path("ffmpeg").await,
         cache: Arc::new(DashMap::new()),
     };
 
-    my_main(config, state).await
+    my_main(config, state, cli).await
+}
+
+async fn get_program_path(program_name: &str) -> OsString {
+    let path = which::which(program_name).unwrap();
+    let path = fs::read_link(&path).await.unwrap_or_else(|_| path.into());
+    OsString::from(path.to_string_lossy().into_owned())
 }
 
 pub fn parse_sha256_from_path(path: &str) -> Result<Vec<u8>, (StatusCode, String)> {
@@ -366,7 +386,7 @@ pub async fn welcome_page_handler(
 
 pub async fn get_handler(
     headers: axum::http::HeaderMap,
-    Extension(config): Extension<Config>,
+    Extension(_config): Extension<Config>,
     Extension(state): Extension<State>,
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
@@ -556,16 +576,18 @@ pub async fn put_handler(
         }
 
         let data = data.to_vec();
-        let sha256 = sha2::Sha256::digest(&data).to_vec();
+        // let sha256 = sha2::Sha256::digest(&data).to_vec();
+        let sha256 = get_sha256(&data).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "sha256 error".to_string()))?;
         let sha256_hex = hex::encode(&sha256);
         let e = check_action(&headers, "upload", Some(sha256.clone()))?;
         log!("PUT {} pubkey: {}", sha256_hex, e.pubkey.to_hex());
 
         let data = if path == "media" {
-            let data2 = strip_metadata(&config, &state, data).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "metadata stripping error".to_string()))?;
+            let data2 = strip_metadata_2(&config, &state, data, false).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "metadata stripping error".to_string()))?;
+            let sha256_2 = get_sha256(&data2).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "sha256 error".to_string()))?;
             sqlx::query!(r#"INSERT INTO media_metadata_stripping VALUES ($1, $2, now(), $3)"#, 
                 &sha256,
-                &sha2::Sha256::digest(&data2).to_vec(),
+                &sha256_2,
                 json!({"mod": "primal_blossom_server", "func": "put_handler", "pubkey": e.pubkey.to_hex()})
             ).execute(&state.cache_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
             data2
@@ -580,21 +602,24 @@ pub async fn put_handler(
             // wait_processing_node(&config, nid).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "wait_processing_node failed".to_string()))?;
         }
 
-        Ok(make_response(StatusCode::OK, "application/json", 
-                serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
-                vec![]))
+        let res = make_response(StatusCode::OK, "application/json", 
+            serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
+            vec![]);
+        dbg!(&res);
+        Ok(res)
     } else {
         Err((StatusCode::NOT_FOUND, "not found".to_string()))
     }
 }
 
 pub async fn import_blob(e: &Event, data: &Vec<u8>, config: &Config, state: &State) -> Result<(Value, String), String> {
-    let sha256 = sha2::Sha256::digest(&data).to_vec();
+    // let sha256 = sha2::Sha256::digest(&data).to_vec();
+    let sha256 = get_sha256(data).await?;
     let sha256_hex = hex::encode(&sha256);
     log!("import_blob: sha256: {sha256_hex}");
 
     let size = data.len() as i64;
-    let content_type = parse_mimetype(&data.to_vec()).await.map_log_err("parsing mimetype failed".to_string())?;
+    let content_type = parse_mimetype(config, &data.to_vec()).await.map_log_err("parsing mimetype failed".to_string())?;
     let ext = MIMETYPE_EXT.get(&content_type.as_str()).unwrap_or(&"");
 
     let t = chrono::Local::now().timestamp() as i64;
@@ -616,16 +641,7 @@ pub async fn import_blob(e: &Event, data: &Vec<u8>, config: &Config, state: &Sta
 
         if !tokio::fs::metadata(&path).await.is_ok() {
             let path_tmp = format!("{path}.tmp");
-            {
-                let mut file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path_tmp)
-                    .await
-                    .map_log_err("file creating failed".to_string())?;
-                file.write_all(&data).await.map_log_err("file writing failed".to_string())?;
-            }
+            write_to_file(&data, &path_tmp).await.map_log_err("file writing failed".to_string())?;
             tokio::fs::rename(&path_tmp, &path).await.map_log_err("file renaming failed".to_string())?;
             log!("{path_tmp} -> {path}: ok");
         }
@@ -782,27 +798,35 @@ static MIMETYPE_EXT: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
     ].iter().cloned().collect()
 });
 
-pub async fn parse_mimetype(data: &Vec<u8>) -> tokio::io::Result<String> {
-    use tempfile::tempdir;
-    let dir = tempdir()?;
-    let path = dir.path().join("mimefile-parsing");
+struct TempFile {
+    path: String,
+}
 
-    use tokio::fs::OpenOptions;
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .await?;
+impl TempFile {
+    fn new(config: &Config) -> Self {
+        TempFile { 
+            path: format!("{}/{}", config.tempdir, uuid::Uuid::new_v4().to_string()),
+        }
+    }
+}
 
-    f.write_all(data).await?;
-    f.flush().await?;
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        eprintln!("TempFile dropped: {}", self.path);
+        if std::path::Path::new(&self.path).exists() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
-    let p = path.to_string_lossy().into_owned();
+pub async fn parse_mimetype(config: &Config, data: &Vec<u8>) -> tokio::io::Result<String> {
+    let tempfile = TempFile::new(config);
+    write_to_file(data, &tempfile.path).await?;
 
     let output = Command::new("file")
         .arg("-b")
         .arg("--mime-type")
-        .arg(&p)
+        .arg(&tempfile.path)
         .output()
         .await?;
 
@@ -810,14 +834,39 @@ pub async fn parse_mimetype(data: &Vec<u8>) -> tokio::io::Result<String> {
     Ok(mime_type)
 }
 
-pub async fn execute_process(sandboxing: bool, state: &State, program_path: &OsString, args: &[&str], data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut cmd = if sandboxing {
+async fn write_to_file(data: &Vec<u8>, path: &String) -> Result<(), std::io::Error> {
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    f.write_all(data).await?;
+    f.flush().await?;
+    Ok(())
+}
+
+async fn read_from_file(path: &String) -> Result<Vec<u8>, std::io::Error> {
+    let mut f = tokio::fs::OpenOptions::new()
+       .read(true)
+       .create(false)
+       .truncate(false)
+       .open(path)
+       .await?;
+    let mut data = Vec::new();
+    f.read_to_end(&mut data).await?;
+    Ok(data)
+}
+
+pub async fn execute_process(config: &Config, _state: &State, program_path: &OsString, args: &[&str], data: &[u8], verbose: bool) -> io::Result<Vec<u8>> {
+    let mut cmd = if config.sandboxing {
         let mut cmd = Command::new("bwrap");
         cmd
             .arg("--new-session")
             .arg("--die-with-parent")
             .arg("--unshare-net")
             .arg("--ro-bind").arg("/nix").arg("/nix")
+            .arg("--bind").arg(&config.tempdir).arg(&config.tempdir)
             .arg(program_path);
         cmd
     } else {
@@ -826,8 +875,12 @@ pub async fn execute_process(sandboxing: bool, state: &State, program_path: &OsS
 
     cmd.args(args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped());
+    if !verbose {
+        cmd.stderr(Stdio::null());
+    }
+
+    if verbose { dbg!(&cmd); }
 
     let mut child = cmd.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -835,22 +888,56 @@ pub async fn execute_process(sandboxing: bool, state: &State, program_path: &OsS
     }
 
     let output = child.wait_with_output().await?;
-    // dbg!(&cmd, program_path, output.status);
+
+    if verbose { dbg!(&cmd, program_path, output.status); }
+
     Ok(output.stdout)
 }
 
-pub async fn strip_metadata(config: &Config, state: &State, data: Vec<u8>) -> io::Result<Vec<u8>> {
-    match execute_process(config.sandboxing, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &data).await {
+pub async fn strip_metadata(config: &Config, state: &State, data: Vec<u8>, verbose: bool) -> io::Result<Vec<u8>> {
+    match execute_process(config, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &data, verbose).await {
         Ok(output) => Ok(output),
         Err(_) => {
-            let mime_type = parse_mimetype(&data).await?;
+            let mime_type = parse_mimetype(config, &data).await?;
             if let Some(ext) = MIMETYPE_EXT.get(&mime_type.as_str()) {
                 let ext = ext.replace(&".", &"");
-                execute_process(config.sandboxing, state, &state.ffmpeg_path, &["-y", "-i", "-", "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-f", &ext, "-"], &data).await
+                execute_process(config, state, &state.ffmpeg_path, &["-y", "-i", "-", "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-f", &ext, "-"], &data, verbose).await
             } else {
                 Err(io::Error::new(io::ErrorKind::Other, "unsupported mime type"))
             }
         }
+    }
+}
+
+pub async fn strip_metadata_2(config: &Config, state: &State, data: Vec<u8>, verbose: bool) -> anyhow::Result<Vec<u8>> {
+    let mime_type = parse_mimetype(config, &data).await?;
+    if verbose { eprintln!("mime type: {mime_type}"); }
+
+    let data = execute_process(config, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &data, verbose).await?;
+
+    if mime_type.starts_with("image/") {
+        return Ok(data);
+    }
+
+    if let Some(ext) = MIMETYPE_EXT.get(&mime_type.as_str()) {
+        let ext = ext.replace(&".", &"");
+        if verbose { eprintln!("ext: {ext}"); }
+
+        let file1 = TempFile::new(config);
+        if verbose { eprintln!("file1: {}", file1.path); }
+        write_to_file(&data, &file1.path).await?;
+
+        let file2 = TempFile::new(config);
+        if verbose { eprintln!("file2: {}", file2.path); }
+
+        execute_process(config, state, &state.ffmpeg_path, &["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-f", &ext, &file2.path], &vec![], verbose).await?;
+
+        if !fs::metadata(&file2.path).await.is_ok() {
+            anyhow::bail!("file not found: {}", file2.path);
+        }
+        Ok(read_from_file(&file2.path).await?)
+    } else {
+        anyhow::bail!("unsupported mime type")
     }
 }
 
@@ -901,7 +988,8 @@ pub async fn cache_data(
     config: &Config,
     data: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    let sha256 = sha2::Sha256::digest(&data).to_vec();
+    // let sha256 = sha2::Sha256::digest(&data).to_vec();
+    let sha256 = get_sha256(&data).await?;
     let sha256_hex = hex::encode(&sha256);
     let dir = format!(
         "{}/{}/{}",
@@ -916,14 +1004,7 @@ pub async fn cache_data(
 
     let path = format!("{}/{}", dir, sha256_hex);
     if !std::path::Path::new(path.as_str()).exists() {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .await
-            .map_log_err("file creating failed".to_string())?;
-        file.write_all(&data).await.map_log_err("file writing failed".to_string())?;
+        write_to_file(&data, &path).await.map_log_err("file writing failed".to_string())?;
     }
 
     Ok(sha256)
@@ -1031,3 +1112,9 @@ pub async fn wait_processing_node(
     Err(format!("processing node {} timed out", hex::encode(node_id)).to_string())
 }
 
+async fn get_sha256(data: &Vec<u8>) -> Result<Vec<u8>, String> {
+    let data = data.clone();
+    tokio::task::spawn_blocking(|| {
+        sha2::Sha256::digest(data).to_vec()
+    }).await.map_err(|_| "sha256 error".to_string())
+}

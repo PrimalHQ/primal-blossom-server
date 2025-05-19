@@ -25,7 +25,7 @@ while true; do
 
     pids="$(pgrep -f "^$prog" | tr '\n' ' ')"
 
-    RUST_BACKTRACE=full $prog &
+    RUST_BACKTRACE=full $prog serve &
 
     sleep 0.5
 
