@@ -16,6 +16,7 @@ A Nostr-based media server implementing Blossom protocol [https://github.com/hzr
 - Nostr event-based authentication
 - Content delivery via local storage or CDN
 - Sub-process sandboxing capabilities
+- Rolling upgrades and zero-downtime deployment
 
 ## Architecture Overview
 
