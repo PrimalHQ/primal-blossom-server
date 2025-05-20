@@ -52,7 +52,7 @@ INSERT INTO media_storage_priority VALUES ('st1', 1000); -- should match local s
 - Run the following command:
 
 ```bash
-nix develop -c sh -c '$rustup_init; DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json'
+nix develop -c sh -c '$rustup_init; DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json serve'
 ```
 
 ## API Endpoints
