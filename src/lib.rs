@@ -319,11 +319,11 @@ pub async fn check_action(
         return Err((StatusCode::UNAUTHORIZED, "pubkey is blocked".to_string()));
     }
 
-    // if let Some(ref x_tag_hash) = x_tag_hash {
-    //     if is_blob_blocked(state, x_tag_hash).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
-    //         return Err((StatusCode::UNAUTHORIZED, "blob is blocked".to_string()));
-    //     }
-    // }
+    if let Some(ref x_tag_hash) = x_tag_hash {
+        if is_blob_blocked(state, x_tag_hash).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
+            return Err((StatusCode::UNAUTHORIZED, "blob is blocked".to_string()));
+        }
+    }
 
     Ok(event)
 }
