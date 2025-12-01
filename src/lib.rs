@@ -899,6 +899,12 @@ static MIMETYPE_EXT: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
         ("text/html", ".html"),
         ("text/javascript", ".js"),
         ("application/wasm", ".wasm"),
+        ("audio/mpeg", ".mp3"),
+        ("audio/wav", ".wav"),
+        ("audio/flac", ".flac"),
+        ("audio/ogg", ".ogg"),
+        ("audio/aac", ".aac"),
+        ("application/pdf", ".pdf"),
     ].iter().cloned().collect()
 });
 
@@ -1017,9 +1023,19 @@ pub async fn strip_metadata_2(config: &Config, state: &State, input_data: Vec<u8
     let mime_type = parse_mimetype(config, &input_data).await?;
     if verbose { eprintln!("mime type: {mime_type}"); }
 
+    // For audio files, exiftool typically doesn't support modification, so skip that step
+    if mime_type.starts_with("audio/") {
+        return Ok(input_data);
+    }
+
     let data = execute_process(config, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &input_data, verbose).await?;
 
     if mime_type.starts_with("image/") {
+        return Ok(data);
+    }
+
+    // For PDFs and other document types, return the exiftool-processed data without ffmpeg
+    if mime_type.starts_with("application/pdf") || mime_type.starts_with("text/") {
         return Ok(data);
     }
 
@@ -1040,7 +1056,9 @@ pub async fn strip_metadata_2(config: &Config, state: &State, input_data: Vec<u8
         let file2 = TempFile::new(config);
         if verbose { eprintln!("file2: {}", file2.path); }
 
-        execute_process(config, state, &state.ffmpeg_path, &["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-f", &ext, &file2.path], &vec![], verbose).await?;
+        let args = vec!["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", &file2.path];
+
+        execute_process(config, state, &state.ffmpeg_path, &args, &vec![], verbose).await?;
 
         if !fs::metadata(&file2.path).await.is_ok() {
             anyhow::bail!("file not found: {}", file2.path);
