@@ -49,11 +49,11 @@ pub fn log(s: String) {
 macro_rules! log {
     // match: log!( "foo" )
     ($msg:expr) => {
-        $crate::log(format!($msg))
+        $crate::log(strip_ansi_escapes::strip_str(format!($msg)))
     };
     // match: log!( "foo {} {}", a, b )
     ($fmt:expr, $($arg:tt)+) => {
-        $crate::log(format!($fmt, $($arg)+))
+        $crate::log(strip_ansi_escapes::strip_str(format!($fmt, $($arg)+)))
     };
 }
 
@@ -127,6 +127,7 @@ pub struct Config {
     pub binary_data_cache_dir: String,
     pub cache_database_url: String,
     pub membership_database_url: String,
+    pub log_database_url: Option<String>,
     pub local_storages: HashMap<String, String>,
     pub sandboxing: bool,
     pub tempdir: String,
@@ -136,9 +137,11 @@ pub struct Config {
 pub struct State {
     pub cache_pool: PgPool,
     pub membership_pool: PgPool,
+    pub log_pool: Option<PgPool>,
     pub exiftool_path: OsString,
     pub ffmpeg_path: OsString,
     pub cache: Arc<DashMap<Vec<u8>, Option<Upload>>>,
+    pub hostname: String,
 }
 
 use std::future::Future;
@@ -163,9 +166,17 @@ where
             .max_connections(10)
             .min_connections(1)
             .connect(&config.membership_database_url).await?,
+        // log_pool: None,
+        log_pool: if let Some(db_url) = &config.log_database_url {
+            Some(PoolOptions::new()
+            .max_connections(10)
+            .min_connections(1)
+            .connect(&db_url).await?)
+        } else { None },
         exiftool_path: get_program_path("exiftool").await,
         ffmpeg_path:   get_program_path("ffmpeg").await,
         cache: Arc::new(DashMap::new()),
+        hostname: hostname::get()?.to_string_lossy().into_owned(),
     };
 
     my_main(config, state, cli).await
@@ -218,10 +229,11 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
 }
 
-pub fn check_action(
+pub async fn check_action(
     headers: &axum::http::HeaderMap,
     action: &str,
     x_tag_hash: Option<Vec<u8>>,
+    state: &State,
 ) -> Result<Event, (StatusCode, String)> {
     // 1) get the header
     let auth = headers
@@ -298,6 +310,21 @@ pub fn check_action(
         return Err((StatusCode::UNAUTHORIZED, "invalid x tag".to_string()));
     }
 
+    let r = sqlx::query!(
+        r#"SELECT 1 as exists FROM filterlist WHERE target = $1 AND target_type = 'pubkey' and grp = 'csam' and blocked LIMIT 1"#,
+        &event.pubkey.to_bytes(),
+    ).fetch_optional(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+
+    if r.is_some() {
+        return Err((StatusCode::UNAUTHORIZED, "pubkey is blocked".to_string()));
+    }
+
+    // if let Some(ref x_tag_hash) = x_tag_hash {
+    //     if is_blob_blocked(state, x_tag_hash).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))? {
+    //         return Err((StatusCode::UNAUTHORIZED, "blob is blocked".to_string()));
+    //     }
+    // }
+
     Ok(event)
 }
 
@@ -361,7 +388,7 @@ pub async fn head_handler(
             None => return Err((axum::http::StatusCode::UNAUTHORIZED, "X-SHA-256 request header is missing".to_string())),
         };
 
-        check_action(&headers, "upload", Some(sha256))?;
+        check_action(&headers, "upload", Some(sha256), &state).await?;
 
         Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![]))
     } else {
@@ -419,7 +446,7 @@ pub async fn get_list_handler(
     log!("GET /list/{path} | {}", get_user_agent(&headers));
     
     let pk = PublicKey::parse(&path).map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
-    let e = check_action(&headers, "list", None)?;
+    let e = check_action(&headers, "list", None, &state).await?;
     
     if e.pubkey != pk {
         return Err((StatusCode::UNAUTHORIZED, "invalid pubkey".to_string()));
@@ -470,7 +497,7 @@ pub async fn delete_handler(
     let b = find_blob(&state, sha256.clone()).await?;
 
     if let Some(b) = b {
-        let e = check_action(&headers, "delete", Some(b.sha256))?;
+        let e = check_action(&headers, "delete", Some(b.sha256), &state).await?;
         log!("DELETE pubkey: {}", e.pubkey.to_hex());
 
         if let Some(_) = sqlx::query!(
@@ -546,6 +573,57 @@ pub async fn put_handler(
     Path(path): Path<String>,
     data: Bytes
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
+    let r = put_handler_(
+        &headers,
+        &config,
+        &state,
+        &path,
+        &data
+    ).await;
+
+    let request_headers: HashMap<String, String> = headers.iter()
+        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+        .collect();
+
+    match r {
+        Ok((r, e)) => {
+            let response_headers: HashMap<String, String> = r.headers().iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), s.to_string())))
+                .collect();
+
+            let _ = insert_log(&state, "blossom.put_handler", &json!({
+                "request_headers": request_headers,
+                "path": path,
+                "size": data.len(),
+                "auth_event": json!(e),
+
+                "response_status": r.status().as_u16(),
+                "response_headers": response_headers,
+                "response": json!(format!("{:?}", r)),
+            })).await;
+            Ok(r)
+        },
+        Err((status, msg)) => {
+            let _ = insert_log(&state, "blossom.put_handler", &json!({
+                "request_headers": request_headers,
+                "path": path,
+                "size": data.len(),
+
+                "response_status": status.as_u16(),
+                "error_msg": msg,
+            })).await;
+            Err((status, msg))
+        }
+    }
+}
+
+pub async fn put_handler_(
+    headers: &axum::http::HeaderMap,
+    config: &Config,
+    state: &State,
+    path: &String,
+    data: &Bytes,
+) -> Result<(Response<axum::body::Body>, Event), (StatusCode, String)> {
     log!("PUT {path}: got {} bytes | {}", data.len(), get_user_agent(&headers));
 
     if path == "mirror" {
@@ -553,7 +631,7 @@ pub async fn put_handler(
         let url = req.get("url").ok_or((StatusCode::BAD_REQUEST, "missing url".to_string()))?.as_str().ok_or((StatusCode::BAD_REQUEST, "invalid url".to_string()))?;
         let parsed_url = reqwest::Url::parse(&url).map_log_err((StatusCode::BAD_REQUEST, "invalid url".to_string()))?;
         let sha256 = parse_sha256_from_path(parsed_url.path())?;
-        let e = check_action(&headers, "upload", Some(sha256.clone()))?;
+        let e = check_action(&headers, "upload", Some(sha256.clone()), &state).await?;
         log!("PUT {} pubkey: {}", hex::encode(&sha256), e.pubkey.to_hex());
 
         let data = download(url, &config).await.map_log_err((StatusCode::BAD_REQUEST, "download error".to_string()))?;
@@ -565,9 +643,9 @@ pub async fn put_handler(
             // wait_processing_node(&config, nid).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "wait_processing_node failed".to_string()))?;
         }
 
-        Ok(make_response(StatusCode::OK, "application/json", 
+        Ok((make_response(StatusCode::OK, "application/json", 
                 serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
-                vec![]))
+                vec![]), e))
 
     } else if path == "upload" || path == "media" {
         #[cfg(not(feature = "media-processing"))]
@@ -579,7 +657,7 @@ pub async fn put_handler(
         // let sha256 = sha2::Sha256::digest(&data).to_vec();
         let sha256 = get_sha256(&data).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "sha256 error".to_string()))?;
         let sha256_hex = hex::encode(&sha256);
-        let e = check_action(&headers, "upload", Some(sha256.clone()))?;
+        let e = check_action(&headers, "upload", Some(sha256.clone()), &state).await?;
         log!("PUT {} pubkey: {}", sha256_hex, e.pubkey.to_hex());
 
         let data = if path == "media" {
@@ -602,9 +680,9 @@ pub async fn put_handler(
             // wait_processing_node(&config, nid).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "wait_processing_node failed".to_string()))?;
         }
 
-        let res = make_response(StatusCode::OK, "application/json", 
-            serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
-            vec![]);
+        let res = (make_response(StatusCode::OK, "application/json", 
+                serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
+                vec![]), e);
         dbg!(&res);
         Ok(res)
     } else {
@@ -618,6 +696,10 @@ pub async fn import_blob(e: &Event, data: &Vec<u8>, config: &Config, state: &Sta
     let sha256_hex = hex::encode(&sha256);
     log!("import_blob: sha256: {sha256_hex}");
 
+    if is_blob_blocked(state, &sha256).await.map_log_err("db error".to_string())? {
+        return Err("blob blocked".to_string());
+    }
+    
     let size = data.len() as i64;
     let content_type = parse_mimetype(config, &data.to_vec()).await.map_log_err("parsing mimetype failed".to_string())?;
     let ext = MIMETYPE_EXT.get(&content_type.as_str()).unwrap_or(&"");
@@ -721,6 +803,27 @@ pub async fn find_blob(
     }
     // log!("cache miss for {sha256}");
 
+    // let t = chrono::Utc::now();
+    let r = sqlx::query!(
+        r#"
+        SELECT BOOL_AND(COALESCE(fl.blocked, FALSE)) AS is_blocked
+        FROM media_uploads mu
+        LEFT JOIN filterlist fl ON fl.target = mu.pubkey AND fl.target_type = 'pubkey'
+        WHERE mu.sha256 = $1
+        "#,
+        &sha256
+    ).fetch_one(&state.membership_pool).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "db error".to_string()))?;
+
+    // let dt = chrono::Utc::now() - t;
+    // log!("dt: {:?}", dt.num_microseconds());
+
+    if r.is_blocked.unwrap_or(false) {
+        log!("error: uploaded blob {} is blocked", hex::encode(&sha256));
+        let result = None;
+        state.cache.insert(sha256.clone(), result.clone());
+        return Ok(result);
+    }
+
     let r = sqlx::query!(
         r#"
         SELECT ms.sha256,
@@ -789,6 +892,7 @@ static MIMETYPE_EXT: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
         ("video/webm", ".webm"),
         ("video/quicktime", ".mov"),
         ("video/x-matroska", ".mkv"),
+        ("video/3gpp", ".3gp"),
         ("image/vnd.microsoft.icon", ".ico"),
         ("text/plain", ".txt"),
         ("application/json", ".json"),
@@ -909,15 +1013,21 @@ pub async fn strip_metadata(config: &Config, state: &State, data: Vec<u8>, verbo
     }
 }
 
-pub async fn strip_metadata_2(config: &Config, state: &State, data: Vec<u8>, verbose: bool) -> anyhow::Result<Vec<u8>> {
-    let mime_type = parse_mimetype(config, &data).await?;
+pub async fn strip_metadata_2(config: &Config, state: &State, input_data: Vec<u8>, verbose: bool) -> anyhow::Result<Vec<u8>> {
+    let mime_type = parse_mimetype(config, &input_data).await?;
     if verbose { eprintln!("mime type: {mime_type}"); }
 
-    let data = execute_process(config, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &data, verbose).await?;
+    let data = execute_process(config, state, &state.exiftool_path, &["-ignoreMinorErrors", "-all=", "-tagsfromfile", "@", "-Orientation", "-"], &input_data, verbose).await?;
 
     if mime_type.starts_with("image/") {
         return Ok(data);
     }
+
+    let data = if data.len() == 0 && mime_type.starts_with("video/") {
+        input_data
+    } else {
+        data
+    };
 
     if let Some(ext) = MIMETYPE_EXT.get(&mime_type.as_str()) {
         let ext = ext.replace(&".", &"");
@@ -930,7 +1040,7 @@ pub async fn strip_metadata_2(config: &Config, state: &State, data: Vec<u8>, ver
         let file2 = TempFile::new(config);
         if verbose { eprintln!("file2: {}", file2.path); }
 
-        execute_process(config, state, &state.ffmpeg_path, &["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-f", &ext, &file2.path], &vec![], verbose).await?;
+        execute_process(config, state, &state.ffmpeg_path, &["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-f", &ext, &file2.path], &vec![], verbose).await?;
 
         if !fs::metadata(&file2.path).await.is_ok() {
             anyhow::bail!("file not found: {}", file2.path);
@@ -1113,8 +1223,45 @@ pub async fn wait_processing_node(
 }
 
 async fn get_sha256(data: &Vec<u8>) -> Result<Vec<u8>, String> {
-    let data = data.clone();
+    let data = data.clone(); // TODO use Arc<Vec<u8>> to avoid cloning and blocking async runtime
     tokio::task::spawn_blocking(|| {
         sha2::Sha256::digest(data).to_vec()
     }).await.map_err(|_| "sha256 error".to_string())
 }
+
+async fn insert_log(
+    state: &State,
+    tag: &str,
+    data: &Value,
+) -> anyhow::Result<()> {
+    dbg!(&data);
+    if let Some(log_pool) = &state.log_pool {
+        let r = sqlx::query(
+            r#"
+            INSERT INTO log (t, hostname, node, tag, data)
+            VALUES (now(), $1, $2, $3, $4)
+            "#)
+            .bind(state.hostname.clone())
+            .bind("")
+            .bind(tag)
+            .bind(data)
+        .execute(log_pool).await;
+
+        if let Err(e) = r {
+            eprintln!("insert_log failed: {}", e);
+        }
+    }
+    Ok(())
+}
+
+async fn is_blob_blocked(state: &State, sha256: &Vec<u8>) -> Result<bool, String> {
+    Ok(sqlx::query!(r#"
+        select 1 as x
+        from media_uploads_media_block_csam mumb
+        where mumb.sha256 = $1
+        limit 1
+        "#, 
+        &sha256,
+    ).fetch_optional(&state.cache_pool).await.map_err(|_| "db error".to_string())?.is_some())
+}
+

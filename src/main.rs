@@ -31,7 +31,6 @@ use primal_blossom_server::{
     State,
     Cli,
     Commands,
-    strip_metadata,
     strip_metadata_2,
 };
 
@@ -43,9 +42,6 @@ async fn shutdown_signal() {
     }
     log!("signal received, shutting down");
 }
-
-use primal_blossom_server::SubscriberExt;
-use primal_blossom_server::SubscriberInitExt;
 
 async fn my_main(config: Config, state: State, cli: Cli) -> anyhow::Result<()> {
     dbg!(&config);
