@@ -131,6 +131,18 @@ pub struct Config {
     pub local_storages: HashMap<String, String>,
     pub sandboxing: bool,
     pub tempdir: String,
+    // SSH fallback: when a host-local file is missing from local disk, pull it from
+    // this host via `ssh <host> cat <remote_base><relpath>`, verify sha256, and stream it.
+    // Disabled unless both host and remote_base are set.
+    pub ssh_fallback_host: Option<String>,         // e.g. "blob-archive"
+    pub ssh_fallback_remote_base: Option<String>,  // e.g. "/srv/blobs"
+    pub ssh_fallback_timeout_secs: Option<u64>,    // default 300
+    // The node-local directory that media.primal.net serves from on this host (the
+    // nginx docroot for media_server_url). Used to decide redirect-vs-ssh-serve: if a
+    // file is present here the 302 redirect works, otherwise we SSH-serve it. Cross-node
+    // mounts in `local_storages` are intentionally NOT consulted. If unset, falls back to
+    // checking all `local_storages` (which may misfire on cross-mounts). e.g. "/mnt/st1/var/www"
+    pub media_serving_dir: Option<String>,
 }
 
 #[derive(Debug,Clone)]
@@ -413,15 +425,51 @@ pub async fn welcome_page_handler(
 
 pub async fn get_handler(
     headers: axum::http::HeaderMap,
-    Extension(_config): Extension<Config>,
+    Extension(config): Extension<Config>,
     Extension(state): Extension<State>,
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("GET {path} | {}", get_user_agent(&headers));
-    
+
+    let sha256 = parse_sha256_from_path(&path)?;
     let rec = extract_blob_record(&state, &path).await?;
 
     if let Some(r) = rec {
+        // For host-local files (media_url points at our media server) whose bytes are
+        // missing from local disk, pull them from the SSH fallback host, verify the
+        // sha256, and stream them directly instead of redirecting to a 404.
+        if ssh_fallback_enabled(&config) && r.media_url.starts_with(&config.media_server_url) {
+            let sha256_hex = hex::encode(&sha256);
+            if let Ok(rel) = remote_relpath_for(&r.media_url, &config.media_server_url, &sha256_hex) {
+                if !exists_in_serving_dir(&config, &rel).await {
+                    let remote = format!(
+                        "{}{rel}",
+                        config.ssh_fallback_remote_base.as_deref().unwrap_or("")
+                    );
+                    log!("GET {path}: local miss, fetching from ssh fallback ({}): {remote}",
+                         config.ssh_fallback_host.as_deref().unwrap_or(""));
+                    match ssh_fetch_and_verify(&config, &rel, &sha256).await {
+                        Ok(data) => {
+                            log!("GET {path}: served {} bytes from ssh fallback", data.len());
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, r.content_type)
+                                .header(header::CONTENT_LENGTH, data.len())
+                                .header("Access-Control-Allow-Methods", "*")
+                                .header("Access-Control-Allow-Origin", "*")
+                                .header("Access-Control-Allow-Headers", "*")
+                                .body(axum::body::Body::from(data))
+                                .unwrap());
+                        }
+                        Err(e) => {
+                            log!("GET {path}: ssh fallback failed: {e}");
+                            return Err((StatusCode::NOT_FOUND, "not found".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Response::builder()
             .status(StatusCode::FOUND)
             .header(header::LOCATION, r.media_url)
@@ -862,6 +910,130 @@ pub async fn find_blob(
     Ok(result)
 }
 
+// ---------- SSH fallback for blobs missing from local disk ----------
+
+pub fn ssh_fallback_enabled(config: &Config) -> bool {
+    config.ssh_fallback_host.is_some() && config.ssh_fallback_remote_base.is_some()
+}
+
+/// Derive and strictly validate the relative storage path from a DB `media_url`.
+/// The path is DB-derived (the row is keyed by a hex-validated sha256), but we
+/// validate defensively so it can never escape `/uploads*` or carry shell
+/// metacharacters. `sha256_hex` is the hex stem parsed from the request path; the
+/// fetched file's name must match it, binding the remote path to the requested hash.
+pub fn remote_relpath_for(
+    media_url: &str,
+    media_server_url: &str,
+    sha256_hex: &str,
+) -> Result<String, (StatusCode, String)> {
+    let bad = |m: &str| (StatusCode::NOT_FOUND, m.to_string());
+
+    let rel = media_url
+        .strip_prefix(media_server_url)
+        .ok_or_else(|| bad("media_url not on media server"))?;
+
+    if !rel.starts_with('/') {
+        return Err(bad("relpath must start with /"));
+    }
+    if !(rel.starts_with("/uploads/") || rel.starts_with("/uploads2/")) {
+        return Err(bad("relpath must be under /uploads"));
+    }
+    // allowlist: alphanumerics plus `/._-` only => no spaces, NUL, or shell metacharacters
+    if !rel
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return Err(bad("relpath has disallowed characters"));
+    }
+    // reject empty / "." / ".." path components (traversal)
+    for comp in rel.split('/').skip(1) {
+        if comp.is_empty() || comp == "." || comp == ".." {
+            return Err(bad("relpath has invalid component"));
+        }
+    }
+    // bind the filename stem to the requested hash
+    let fname = rel.rsplit('/').next().unwrap_or("");
+    let stem = fname.split('.').next().unwrap_or("");
+    if stem != sha256_hex {
+        return Err(bad("relpath filename does not match sha256"));
+    }
+
+    Ok(rel.to_string())
+}
+
+/// True if the blob exists in the directory media.primal.net serves from on this
+/// node (so the 302 redirect would succeed). Cross-node mounts are intentionally
+/// not consulted. If `media_serving_dir` is unset, falls back to checking every
+/// configured `local_storages` dir (back-compat; may misfire on cross-mounts).
+pub async fn exists_in_serving_dir(config: &Config, rel: &str) -> bool {
+    match config.media_serving_dir.as_deref() {
+        Some(dir) => tokio::fs::metadata(format!("{dir}{rel}")).await.is_ok(),
+        None => {
+            for hostdir in config.local_storages.values() {
+                if tokio::fs::metadata(format!("{hostdir}{rel}")).await.is_ok() {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Pull a blob from the SSH fallback host (`ssh <host> cat <remote_base><rel>`),
+/// returning its bytes only if their sha256 matches `sha256`.
+pub async fn ssh_fetch_and_verify(
+    config: &Config,
+    rel: &str,
+    sha256: &[u8],
+) -> Result<Vec<u8>, String> {
+    let host = config
+        .ssh_fallback_host
+        .as_deref()
+        .ok_or("ssh fallback host not configured")?;
+    let base = config
+        .ssh_fallback_remote_base
+        .as_deref()
+        .ok_or("ssh fallback remote_base not configured")?;
+    let remote = format!("{base}{rel}");
+    let timeout_secs = config.ssh_fallback_timeout_secs.unwrap_or(300);
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        .arg(host)
+        .arg("cat")
+        .arg(&remote)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = cmd.spawn().map_err(|e| format!("ssh spawn failed: {e}"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| format!("ssh fetch timed out after {timeout_secs}s"))?
+    .map_err(|e| format!("ssh wait failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ssh cat failed (status {}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let data = output.stdout;
+    if get_sha256(&data).await?.as_slice() != sha256 {
+        return Err("sha256 mismatch".to_string());
+    }
+    Ok(data)
+}
+
 // ------------------ media ---------------------
 
 pub use tokio::process::Command;
@@ -985,10 +1157,8 @@ pub async fn execute_process(config: &Config, _state: &State, program_path: &OsS
 
     cmd.args(args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    if !verbose {
-        cmd.stderr(Stdio::null());
-    }
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if verbose { dbg!(&cmd); }
 
@@ -1000,6 +1170,17 @@ pub async fn execute_process(config: &Config, _state: &State, program_path: &OsS
     let output = child.wait_with_output().await?;
 
     if verbose { dbg!(&cmd, program_path, output.status); }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if verbose {
+            eprintln!("Command stderr: {}", stderr);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Command failed with status: {}\n", output.status)
+        ));
+    }
 
     Ok(output.stdout)
 }
@@ -1056,7 +1237,7 @@ pub async fn strip_metadata_2(config: &Config, state: &State, input_data: Vec<u8
         let file2 = TempFile::new(config);
         if verbose { eprintln!("file2: {}", file2.path); }
 
-        let args = vec!["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", &file2.path];
+        let args = vec!["-y", "-i", &file1.path, "-map_metadata", "-1", "-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", "-f", &ext, &file2.path];
 
         execute_process(config, state, &state.ffmpeg_path, &args, &vec![], verbose).await?;
 
@@ -1278,8 +1459,110 @@ async fn is_blob_blocked(state: &State, sha256: &Vec<u8>) -> Result<bool, String
         from media_uploads_media_block_csam mumb
         where mumb.sha256 = $1
         limit 1
-        "#, 
+        "#,
         &sha256,
     ).fetch_optional(&state.cache_pool).await.map_err(|_| "db error".to_string())?.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_relpath_for;
+
+    const SRV: &str = "https://media.primal.net";
+    const SHA: &str = "ef940339e4e34e12520827cf3651c8bbd93c33ba3e3d2d80defc3909ec429050";
+
+    fn url(p: &str) -> String {
+        format!("{SRV}{p}")
+    }
+
+    #[test]
+    fn accepts_valid_uploads2_path() {
+        let rel = remote_relpath_for(&url("/uploads2/e/f9/40/ef940339e4e34e12520827cf3651c8bbd93c33ba3e3d2d80defc3909ec429050.mp3"), SRV, SHA).unwrap();
+        assert_eq!(rel, "/uploads2/e/f9/40/ef940339e4e34e12520827cf3651c8bbd93c33ba3e3d2d80defc3909ec429050.mp3");
+    }
+
+    #[test]
+    fn accepts_legacy_uploads_path() {
+        let rel = remote_relpath_for(&url("/uploads/e/f9/40/ef940339e4e34e12520827cf3651c8bbd93c33ba3e3d2d80defc3909ec429050.jpg"), SRV, SHA).unwrap();
+        assert!(rel.starts_with("/uploads/"));
+    }
+
+    #[test]
+    fn rejects_wrong_host_prefix() {
+        assert!(remote_relpath_for("https://evil.example.com/uploads2/e/f9/40/x.mp3", SRV, SHA).is_err());
+    }
+
+    #[test]
+    fn rejects_outside_uploads() {
+        assert!(remote_relpath_for(&url("/etc/passwd"), SRV, SHA).is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(remote_relpath_for(&url("/uploads2/../../etc/passwd"), SRV, SHA).is_err());
+        assert!(remote_relpath_for(&url("/uploads2/e/f9/40/../../../../etc/shadow"), SRV, SHA).is_err());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters() {
+        for p in [
+            "/uploads2/e/f9/40/x;rm -rf.mp3",
+            "/uploads2/e/f9/40/$(whoami).mp3",
+            "/uploads2/e/f9/40/a b.mp3",
+            "/uploads2/e/f9/40/a`id`.mp3",
+        ] {
+            assert!(remote_relpath_for(&url(p), SRV, SHA).is_err(), "should reject {p}");
+        }
+    }
+
+    #[test]
+    fn rejects_filename_not_matching_hash() {
+        assert!(remote_relpath_for(&url("/uploads2/e/f9/40/deadbeef.mp3"), SRV, SHA).is_err());
+    }
+
+    // Live end-to-end check of the real ssh code path. Requires `ssh blob-archive` access and
+    // the file present on that host; run explicitly with `cargo test --lib -- --ignored ssh_live`.
+    fn live_config() -> super::Config {
+        super::Config {
+            port: 0,
+            base_url: "https://blossom.primal.net".into(),
+            media_server_url: SRV.into(),
+            proxy: None,
+            binary_data_cache_dir: "/tmp".into(),
+            cache_database_url: String::new(),
+            membership_database_url: String::new(),
+            log_database_url: None,
+            local_storages: super::HashMap::new(),
+            sandboxing: false,
+            tempdir: "/tmp".into(),
+            ssh_fallback_host: Some("blob-archive".into()),
+            ssh_fallback_remote_base: Some("/srv/blobs".into()),
+            ssh_fallback_timeout_secs: Some(60),
+            media_serving_dir: Some("/mnt/st1/var/www".into()),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ssh_live_fetch_and_verify_matches() {
+        let cfg = live_config();
+        let rel = format!("/uploads2/e/f9/40/{SHA}.mp3");
+        // file is absent from the node-local serving dir -> fallback should engage
+        assert!(!super::exists_in_serving_dir(&cfg, &rel).await,
+                "file unexpectedly present in serving dir; pick a moved-off file");
+        let sha256 = hex::decode(SHA).unwrap();
+        let data = super::ssh_fetch_and_verify(&cfg, &rel, &sha256).await.unwrap();
+        assert_eq!(data.len(), 30378545);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ssh_live_rejects_on_hash_mismatch() {
+        let cfg = live_config();
+        let rel = format!("/uploads2/e/f9/40/{SHA}.mp3");
+        let wrong = vec![0u8; 32]; // wrong expected hash -> must be rejected
+        let err = super::ssh_fetch_and_verify(&cfg, &rel, &wrong).await.unwrap_err();
+        assert!(err.contains("sha256 mismatch"), "unexpected error: {err}");
+    }
 }
 

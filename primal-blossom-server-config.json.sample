@@ -11,5 +11,9 @@
         "st2": "/mnt/st2/var/www"
     },
     "sandboxing": true,
-    "tempdir": "/tmp"
+    "tempdir": "/tmp",
+    "ssh_fallback_host": "blob-archive",
+    "ssh_fallback_remote_base": "/srv/blobs",
+    "ssh_fallback_timeout_secs": 300,
+    "media_serving_dir": "/mnt/st1/var/www"
 }
