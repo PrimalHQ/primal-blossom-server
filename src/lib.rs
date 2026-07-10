@@ -720,6 +720,12 @@ pub async fn put_handler_(
         } else {
             data
         };
+
+        let content_type = parse_mimetype(&config, &data).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "parsing mimetype failed".to_string()))?;
+        if REJECTED_MIMETYPES.contains(content_type.as_str()) {
+            return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("upload rejected: unsupported media type {content_type}")));
+        }
+
         let (r, burl) = import_blob(&e, &data, &config, &state).await.map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "blob import error".to_string()))?;
 
         #[cfg(feature = "media-processing")]
@@ -1041,6 +1047,7 @@ pub use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 pub use std::process::Stdio;
 
 pub use std::collections::HashMap;
+pub use std::collections::HashSet;
 
 pub use once_cell::sync::Lazy;
 pub use tokio::fs;
@@ -1077,6 +1084,13 @@ static MIMETYPE_EXT: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
         ("audio/ogg", ".ogg"),
         ("audio/aac", ".aac"),
         ("application/pdf", ".pdf"),
+    ].iter().cloned().collect()
+});
+
+// MIME types (as detected by `file --mime-type`) that are rejected on upload.
+static REJECTED_MIMETYPES: Lazy<HashSet<&str>> = Lazy::new(|| {
+    [
+        "application/octet-stream",
     ].iter().cloned().collect()
 });
 
