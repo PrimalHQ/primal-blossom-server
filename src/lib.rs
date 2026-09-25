@@ -322,6 +322,103 @@ pub fn make_response(
     builder.body(axum::body::Body::from(body.to_string())).unwrap()
 }
 
+fn make_options_response() -> Response<axum::body::Body> {
+    make_response(
+        StatusCode::OK,
+        "text/plain",
+        "ok",
+        vec![
+            ("Access-Control-Allow-Headers", "Authorization, *"),
+            ("Access-Control-Allow-Methods", "GET, HEAD, PUT, DELETE"),
+        ],
+    )
+}
+
+fn make_blob_redirect_response(record: &BlobRecord) -> Response<axum::body::Body> {
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, &record.media_url)
+        .header(header::CONTENT_TYPE, &record.content_type)
+        .header(header::CONTENT_LENGTH, "0")
+        .header("Access-Control-Allow-Methods", "*")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Headers", "*")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+#[cfg(test)]
+mod bud01_response_tests {
+    use super::{make_blob_redirect_response, make_options_response, BlobRecord};
+    use axum::body::HttpBody;
+    use axum::http::{header, StatusCode};
+
+    #[test]
+    fn preflight_advertises_required_methods() {
+        let response = make_options_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .unwrap(),
+            "Authorization, *"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+                .unwrap(),
+            "GET, HEAD, PUT, DELETE"
+        );
+    }
+
+    #[test]
+    fn blob_redirect_responses_have_matching_metadata() {
+        let record = BlobRecord {
+            media_url: "https://cdn.example/abc123.png".to_string(),
+            content_type: "image/png".to_string(),
+            size: 123,
+        };
+
+        let get_response = make_blob_redirect_response(&record);
+        let head_response = make_blob_redirect_response(&record);
+
+        assert_eq!(get_response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(head_response.status(), get_response.status());
+
+        for name in [
+            header::LOCATION,
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+        ] {
+            assert_eq!(
+                head_response.headers().get(&name),
+                get_response.headers().get(&name)
+            );
+        }
+
+        assert_eq!(
+            get_response.headers().get(header::LOCATION).unwrap(),
+            record.media_url.as_str()
+        );
+        assert_eq!(
+            get_response.headers().get(header::CONTENT_TYPE).unwrap(),
+            record.content_type.as_str()
+        );
+        assert_eq!(
+            get_response.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "0"
+        );
+        assert_eq!(get_response.body().size_hint().exact(), Some(0));
+        assert_eq!(head_response.body().size_hint().exact(), Some(0));
+    }
+}
+
 pub fn get_user_agent(headers: &axum::http::HeaderMap) -> String {
     headers.get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("unknown").to_string()
 }
@@ -333,10 +430,7 @@ pub async fn options_handler(
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("OPTIONS {path} | {}", get_user_agent(&headers));
-    Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![
-        ("Access-Control-Allow-Headers", "Authorization, *"),
-        ("Access-Control-Allow-Methods", "GET, PUT, DELETE"),
-    ]))
+    Ok(make_options_response())
 }
 
 pub async fn head_handler(
@@ -366,9 +460,7 @@ pub async fn head_handler(
         Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![]))
     } else {
         if let Some(r) = extract_blob_record(&state, &path).await? {
-            Ok(make_response(StatusCode::OK, r.content_type.as_str(), "", vec![
-                    (header::CONTENT_LENGTH.as_str(), &r.size.to_string().as_str()),
-            ]))
+            Ok(make_blob_redirect_response(&r))
         } else {
             Err((StatusCode::NOT_FOUND, "not found".to_string()))
         }
@@ -395,15 +487,7 @@ pub async fn get_handler(
     let rec = extract_blob_record(&state, &path).await?;
 
     if let Some(r) = rec {
-        Ok(Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, r.media_url)
-            .header(header::CONTENT_TYPE, r.content_type)
-            .header("Access-Control-Allow-Methods", "*")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Headers", "*")
-            .body(axum::body::Body::empty())
-            .unwrap())
+        Ok(make_blob_redirect_response(&r))
     } else {
         Err((StatusCode::NOT_FOUND, "not found".to_string()))
     }
