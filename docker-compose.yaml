@@ -1,0 +1,60 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: blossom
+      POSTGRES_USER: blossom
+      POSTGRES_PASSWORD: blossom
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blossom -d blossom"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./docker/seed.sql:/docker-entrypoint-initdb.d/002-seed.sql:ro
+
+  storage-init:
+    image: alpine:3.21
+    command: ["chown", "10001:10001", "/data/media", "/data/cache"]
+    volumes:
+      - media-data:/data/media
+      - cache-data:/data/cache
+
+  server:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+    ports:
+      - "8181:8181"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8181/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - ./docker/config.json:/etc/primal-blossom/config.json:ro
+      - media-data:/data/media
+      - cache-data:/data/cache
+
+  media:
+    image: nginx:1.27-alpine
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    volumes:
+      - media-data:/usr/share/nginx/html:ro
+
+volumes:
+  postgres-data:
+  media-data:
+  cache-data:

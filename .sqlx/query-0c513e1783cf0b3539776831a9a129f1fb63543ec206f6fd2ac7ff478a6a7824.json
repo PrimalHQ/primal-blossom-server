@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM media_storage WHERE sha256 = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0c513e1783cf0b3539776831a9a129f1fb63543ec206f6fd2ac7ff478a6a7824"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM media_uploads WHERE sha256 = $1 and pubkey = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "391103194ca9c27bb9b1a8a008bdc9e2f513d0e74331d23b7c523b18c6936f92"
+}

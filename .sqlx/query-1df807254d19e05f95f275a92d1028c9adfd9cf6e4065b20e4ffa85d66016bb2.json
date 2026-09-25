@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT 1 as one\n              FROM media_uploads\n             WHERE sha256 = $1\n               AND pubkey = $2\n               AND media_block_id IS NULL\n             LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1df807254d19e05f95f275a92d1028c9adfd9cf6e4065b20e4ffa85d66016bb2"
+}
