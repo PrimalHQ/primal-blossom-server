@@ -1,0 +1,14 @@
+{
+  "port": 8181,
+  "cache_database_url": "postgresql://blossom:blossom@db:5432/blossom?application_name=blossom-server",
+  "membership_database_url": "postgresql://blossom:blossom@db:5432/blossom?application_name=blossom-server",
+  "base_url": "http://localhost:8181",
+  "media_server_url": "http://localhost:8080",
+  "proxy": null,
+  "binary_data_cache_dir": "/data/cache",
+  "local_storages": {
+    "st1": "/data/media"
+  },
+  "sandboxing": false,
+  "tempdir": "/tmp"
+}

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO media_storage (media_url, storage_provider, added_at, key, h, ext, content_type, size, sha256, media_block_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (h, storage_provider) DO UPDATE\n            SET media_url = $1, added_at = $3, key = $4, ext = $6, content_type = $7, size = $8, sha256 = $9, media_block_id = $10\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7d8b574819647bfff3885b41cbf0529147bca97a54abb888a56cbd8da7c68965"
+}

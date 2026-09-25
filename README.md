@@ -55,6 +55,50 @@ INSERT INTO media_storage_priority VALUES ('st1', 1000); -- should match local s
 nix develop -c sh -c '$rustup_init; DATABASE_URL="postgresql://..." RUST_BACKTRACE=1 $cargo +nightly run --quiet -- --config-file primal-blossom-server-config.json serve'
 ```
 
+## Local Docker Stack
+
+The Docker Compose stack starts PostgreSQL, the Blossom server, and an Nginx
+container that serves uploaded media from shared storage:
+
+```bash
+docker compose up --build
+```
+
+The local services are available at:
+
+- Blossom API: `http://localhost:8181`
+- Uploaded media: `http://localhost:8080`
+- PostgreSQL: `postgresql://blossom:blossom@localhost:5432/blossom`
+
+PostgreSQL is initialized from `schema.sql`, and the `st1` local storage
+provider is inserted automatically. Database records, uploaded media, and the
+processing cache are stored in named Docker volumes.
+
+To stop the stack without removing its data:
+
+```bash
+docker compose down
+```
+
+To remove all local data and re-run database initialization on the next start:
+
+```bash
+docker compose down --volumes
+```
+
+The local image is built with `--no-default-features`. This supports the
+standalone `/upload`, `/mirror`, `/list`, download, and delete flows without
+requiring Primal's external processing-node worker. The `/media` metadata
+stripping endpoint is unavailable in this mode.
+
+When a checked SQL query or `schema.sql` changes, refresh SQLx's offline build
+metadata while the database container is running:
+
+```bash
+DATABASE_URL="postgresql://blossom:blossom@localhost:5432/blossom" \
+  cargo sqlx prepare -- --no-default-features
+```
+
 ## API Endpoints
 
 ### Upload
@@ -129,4 +173,3 @@ This project is licensed under the MIT License.
 
 - Based on the Blossom protocol specifications
 - Uses several open-source libraries (axum, sqlx, nostr-sdk)
-
