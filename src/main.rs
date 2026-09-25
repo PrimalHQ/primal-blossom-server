@@ -3,6 +3,8 @@
 
 pub use std::{env, net::SocketAddr};
 use axum::extract::DefaultBodyLimit;
+use axum::http::{header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue, Response};
+use axum::middleware;
 pub use tokio::signal;
 pub use socket2::{Socket, Domain, Type, Protocol};
 
@@ -44,6 +46,59 @@ async fn shutdown_signal() {
     log!("signal received, shutting down");
 }
 
+fn ensure_cors_header<B>(mut response: Response<B>) -> Response<B> {
+    response
+        .headers_mut()
+        .insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    response
+}
+
+async fn add_cors_header<B>(response: Response<B>) -> Response<B> {
+    ensure_cors_header(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_cors_header;
+    use axum::{
+        body::Body,
+        http::{header::ACCESS_CONTROL_ALLOW_ORIGIN, Method, Request, StatusCode},
+        middleware,
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn cors_header_is_added_to_all_router_responses() {
+        let app = Router::new()
+            .route("/ok", get(|| async { StatusCode::OK }))
+            .route("/error", get(|| async { StatusCode::BAD_REQUEST }))
+            .layer(middleware::map_response(add_cors_header));
+
+        for (method, uri) in [
+            (Method::GET, "/ok"),
+            (Method::GET, "/error"),
+            (Method::GET, "/missing"),
+            (Method::POST, "/ok"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        }
+    }
+}
+
 use primal_blossom_server::SubscriberExt;
 use primal_blossom_server::SubscriberInitExt;
 
@@ -73,6 +128,7 @@ async fn my_main(config: Config, state: State, cli: Cli) -> anyhow::Result<()> {
                 .route("/list/:path", options(options_handler).head(head_handler).get(get_list_handler))
                 .layer(Extension(config))
                 .layer(Extension(state))
+                .layer(middleware::map_response(add_cors_header))
                 // .layer(TraceLayer::new_for_http()
                 //     .make_span_with(DefaultMakeSpan::new().include_headers(true))
                 //     .on_response(DefaultOnResponse::new().include_headers(true)))
@@ -121,4 +177,3 @@ async fn my_main(config: Config, state: State, cli: Cli) -> anyhow::Result<()> {
         }
     }
 }
-
