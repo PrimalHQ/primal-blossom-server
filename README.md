@@ -58,9 +58,23 @@ nix develop -c sh -c '$rustup_init; DATABASE_URL="postgresql://..." RUST_BACKTRA
 ## API Endpoints
 
 ### Upload
+Use the BUD-13 path-based upload endpoint when supported. The authorization event
+must use the `upload` action and include an `x` tag matching the hash in the URL.
+An `X-SHA-256` header is not required.
+
+```
+PUT /<sha256>
+Authorization: Nostr <base64url-encoded-auth-event>
+Content-Type: application/octet-stream
+
+<binary data>
+```
+
+The legacy BUD-02 endpoint remains available for compatibility:
+
 ```
 PUT /upload
-Authorization: Nostr <base64-encoded-auth-event>
+Authorization: Nostr <base64url-encoded-auth-event>
 X-SHA-256: <sha256sum>
 Content-Type: application/octet-stream
 
@@ -70,7 +84,7 @@ Content-Type: application/octet-stream
 ### Upload with Metadata Stripping
 ```
 PUT /media
-Authorization: Nostr <base64-encoded-auth-event>
+Authorization: Nostr <base64url-encoded-auth-event>
 X-SHA-256: <sha256sum>
 Content-Type: application/octet-stream
 
@@ -80,7 +94,7 @@ Content-Type: application/octet-stream
 ### Mirroring
 ```
 PUT /mirror
-Authorization: Nostr <base64-encoded-auth-event>
+Authorization: Nostr <base64url-encoded-auth-event>
 X-SHA-256: <sha256sum>
 Content-Type: application/json
 
@@ -98,15 +112,26 @@ GET /<sha256>.<ext>
 ### Listing User Uploads
 ```
 GET /list/<pubkey>
-Authorization: Nostr <base64-encoded-auth-event>
+Authorization: Nostr <base64url-encoded-auth-event>
 ```
 
 ### Deletion
 ```
 DELETE /<sha256>.<ext>
 X-SHA-256: <sha256sum>
-Authorization: Nostr <base64-encoded-auth-event>
+Authorization: Nostr <base64url-encoded-auth-event>
 ```
+
+Authorization events should use unpadded Base64URL as specified by BUD-11.
+For compatibility with existing clients, the server also accepts padded
+Base64URL and standard Base64 with or without padding.
+
+The optional BUD-13 `POST /<sha256>` mirroring endpoint is not currently
+implemented. Clients can discover supported methods with `OPTIONS /<sha256>`.
+
+When deploying behind a reverse proxy, apply upload authentication and payment
+rules by HTTP method as well as path. BUD-13 reads and writes share the
+`/<sha256>` path.
 
 ## Security Considerations
 
@@ -129,4 +154,3 @@ This project is licensed under the MIT License.
 
 - Based on the Blossom protocol specifications
 - Uses several open-source libraries (axum, sqlx, nostr-sdk)
-
