@@ -215,7 +215,60 @@ pub async fn extract_blob_record(state: &State, path: &str) -> Result<Option<Blo
 }
 
 fn decode_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, s)
+    use base64::{
+        alphabet,
+        engine::{
+            general_purpose::{GeneralPurpose, GeneralPurposeConfig},
+            DecodePaddingMode,
+        },
+        Engine as _,
+    };
+
+    const CONFIG: GeneralPurposeConfig =
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
+    const URL_SAFE: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, CONFIG);
+    const STANDARD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, CONFIG);
+
+    URL_SAFE.decode(s).or_else(|_| STANDARD.decode(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_b64;
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+        Engine as _,
+    };
+
+    #[test]
+    fn decodes_supported_authorization_base64_variants() {
+        // Produces alphabet-specific characters and requires padding, ensuring
+        // every compatibility path is exercised rather than only alphanumerics.
+        let raw = [0xfb, 0xff, 0xff, 0xfa];
+        let standard_padded = STANDARD.encode(raw);
+        let standard_unpadded = STANDARD_NO_PAD.encode(raw);
+        let url_safe_padded = URL_SAFE.encode(raw);
+        let url_safe_unpadded = URL_SAFE_NO_PAD.encode(raw);
+
+        assert!(standard_padded.contains('+') || standard_padded.contains('/'));
+        assert!(standard_padded.ends_with('='));
+        assert!(url_safe_padded.contains('-') || url_safe_padded.contains('_'));
+        assert!(url_safe_padded.ends_with('='));
+
+        for encoded in [
+            standard_padded,
+            standard_unpadded,
+            url_safe_padded,
+            url_safe_unpadded,
+        ] {
+            assert_eq!(decode_b64(&encoded).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_authorization_base64() {
+        assert!(decode_b64("not base64!").is_err());
+    }
 }
 
 pub fn check_action(
