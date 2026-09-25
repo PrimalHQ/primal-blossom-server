@@ -190,6 +190,69 @@ pub fn parse_sha256_from_path(path: &str) -> Result<Vec<u8>, (StatusCode, String
     }
 }
 
+pub fn parse_bud13_sha256_path(path: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    if path.len() != 64
+        || !path
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid sha256 path".to_string(),
+        ));
+    }
+
+    hex::decode(path).map_log_err((
+        StatusCode::BAD_REQUEST,
+        "invalid sha256 path".to_string(),
+    ))
+}
+
+fn methods_for_single_segment_path(path: &str) -> Result<&'static str, (StatusCode, String)> {
+    match path {
+        "upload" => Ok("HEAD, PUT, OPTIONS"),
+        "mirror" => Ok("PUT, OPTIONS"),
+        "media" => {
+            #[cfg(feature = "media-processing")]
+            {
+                Ok("HEAD, PUT, OPTIONS")
+            }
+            #[cfg(not(feature = "media-processing"))]
+            {
+                Err((
+                    StatusCode::NOT_FOUND,
+                    "media upload is not supported".to_string(),
+                ))
+            }
+        }
+        _ => {
+            parse_sha256_from_path(path)?;
+            Ok("GET, HEAD, PUT, DELETE, OPTIONS")
+        }
+    }
+}
+
+fn validate_bud13_query(
+    params: &HashMap<String, String>,
+) -> Result<(), (StatusCode, String)> {
+    if params.contains_key("url") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "url query parameters are not supported for direct uploads".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn bud13_upload_status(already_exists: bool) -> StatusCode {
+    if already_exists {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    }
+}
+
 #[derive(sqlx::FromRow)]
 #[derive(Debug)]
 pub struct BlobRecord {
@@ -234,7 +297,13 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_b64;
+    use super::{
+        bud13_upload_status, decode_b64, get_sha256, make_method_not_allowed_response,
+        make_options_response, methods_for_single_segment_path, parse_bud13_sha256_path,
+        validate_bud13_query,
+    };
+    use axum::body::HttpBody;
+    use axum::http::{header, StatusCode};
     use base64::{
         engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
         Engine as _,
@@ -268,6 +337,111 @@ mod tests {
     #[test]
     fn rejects_invalid_authorization_base64() {
         assert!(decode_b64("not base64!").is_err());
+    }
+
+    #[test]
+    fn parses_strict_bud13_sha256_paths() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(parse_bud13_sha256_path(hash).unwrap(), hex::decode(hash).unwrap());
+    }
+
+    #[test]
+    fn rejects_noncanonical_bud13_sha256_paths() {
+        let lowercase = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let invalid = [
+            &lowercase[..63],
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678g",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.png",
+        ];
+
+        for path in invalid {
+            assert_eq!(
+                parse_bud13_sha256_path(path).unwrap_err().0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn advertises_bud13_put_without_optional_post() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let methods = methods_for_single_segment_path(hash).unwrap();
+        assert_eq!(methods, "GET, HEAD, PUT, DELETE, OPTIONS");
+
+        let response = make_options_response(methods);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers()[header::ALLOW], methods);
+        assert_eq!(response.headers()["Access-Control-Allow-Methods"], methods);
+        assert_eq!(response.headers()["Access-Control-Expose-Headers"], "Allow");
+        assert_eq!(response.body().size_hint().exact(), Some(0));
+    }
+
+    #[test]
+    fn advertises_blob_methods_for_retrieval_compatible_paths() {
+        let uppercase_with_extension =
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF.jpg";
+        assert_eq!(
+            methods_for_single_segment_path(uppercase_with_extension).unwrap(),
+            "GET, HEAD, PUT, DELETE, OPTIONS"
+        );
+
+        let response = make_method_not_allowed_response(
+            methods_for_single_segment_path(uppercase_with_extension).unwrap(),
+        );
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers()[header::ALLOW],
+            "GET, HEAD, PUT, DELETE, OPTIONS"
+        );
+    }
+
+    #[test]
+    fn advertises_legacy_endpoint_methods() {
+        assert_eq!(
+            methods_for_single_segment_path("upload").unwrap(),
+            "HEAD, PUT, OPTIONS"
+        );
+        assert_eq!(
+            methods_for_single_segment_path("mirror").unwrap(),
+            "PUT, OPTIONS"
+        );
+    }
+
+    #[test]
+    fn method_not_allowed_response_advertises_supported_methods() {
+        let methods = "GET, HEAD, PUT, DELETE, OPTIONS";
+        let response = make_method_not_allowed_response(methods);
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::ALLOW], methods);
+        assert_eq!(response.headers()["Access-Control-Allow-Methods"], methods);
+    }
+
+    #[tokio::test]
+    async fn detects_matching_and_mismatching_upload_bodies() {
+        let expected = parse_bud13_sha256_path(
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        )
+        .unwrap();
+        assert_eq!(get_sha256(&b"hello".to_vec()).await.unwrap(), expected);
+        assert_ne!(get_sha256(&b"goodbye".to_vec()).await.unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_url_query_parameters_for_direct_uploads() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("url".to_string(), "https://example.com/blob".to_string());
+        assert_eq!(validate_bud13_query(&params).unwrap_err().0, StatusCode::BAD_REQUEST);
+
+        params.clear();
+        params.insert("source".to_string(), "local".to_string());
+        assert!(validate_bud13_query(&params).is_ok());
+    }
+
+    #[test]
+    fn chooses_created_or_existing_upload_status() {
+        assert_eq!(bud13_upload_status(false), StatusCode::CREATED);
+        assert_eq!(bud13_upload_status(true), StatusCode::OK);
     }
 }
 
@@ -375,6 +549,28 @@ pub fn make_response(
     builder.body(axum::body::Body::from(body.to_string())).unwrap()
 }
 
+pub fn make_options_response(methods: &str) -> Response<axum::body::Body> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::ALLOW, methods)
+        .header("Access-Control-Allow-Methods", methods)
+        .header("Access-Control-Allow-Headers", "Authorization, *")
+        .header("Access-Control-Expose-Headers", "Allow")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+pub fn make_method_not_allowed_response(methods: &str) -> Response<axum::body::Body> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::ALLOW, methods)
+        .header("Access-Control-Allow-Methods", methods)
+        .header("Access-Control-Allow-Origin", "*")
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
 pub fn get_user_agent(headers: &axum::http::HeaderMap) -> String {
     headers.get("User-Agent").and_then(|v| v.to_str().ok()).unwrap_or("unknown").to_string()
 }
@@ -386,10 +582,33 @@ pub async fn options_handler(
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("OPTIONS {path} | {}", get_user_agent(&headers));
-    Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![
-        ("Access-Control-Allow-Headers", "Authorization, *"),
-        ("Access-Control-Allow-Methods", "GET, PUT, DELETE"),
-    ]))
+    Ok(make_options_response(methods_for_single_segment_path(&path)?))
+}
+
+pub async fn list_options_handler(
+    headers: axum::http::HeaderMap,
+    Extension(_config): Extension<Config>,
+    Extension(_state): Extension<State>,
+    Path(path): Path<String>,
+) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
+    log!("OPTIONS /list/{path} | {}", get_user_agent(&headers));
+    PublicKey::parse(&path)
+        .map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
+    Ok(make_options_response("GET, OPTIONS"))
+}
+
+pub async fn method_not_allowed_handler(
+    Path(path): Path<String>,
+) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
+    Ok(make_method_not_allowed_response(methods_for_single_segment_path(&path)?))
+}
+
+pub async fn list_method_not_allowed_handler(
+    Path(path): Path<String>,
+) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
+    PublicKey::parse(&path)
+        .map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
+    Ok(make_method_not_allowed_response("GET, OPTIONS"))
 }
 
 pub async fn head_handler(
@@ -417,6 +636,10 @@ pub async fn head_handler(
         check_action(&headers, "upload", Some(sha256))?;
 
         Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![]))
+    } else if path == "mirror" {
+        Ok(make_method_not_allowed_response(
+            methods_for_single_segment_path(&path)?,
+        ))
     } else {
         if let Some(r) = extract_blob_record(&state, &path).await? {
             Ok(make_response(StatusCode::OK, r.content_type.as_str(), "", vec![
@@ -434,7 +657,7 @@ pub async fn welcome_page_handler(
     Extension(_state): Extension<State>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("GET / | {}", get_user_agent(&headers));
-    Ok(make_response(StatusCode::OK, "text/plain", "Welcome to Primal Blossom server. Implemented: BUD-01, BUD-02, BUD-04, BUD-05", vec![]))
+    Ok(make_response(StatusCode::OK, "text/plain", "Welcome to Primal Blossom server. Implemented: BUD-01, BUD-02, BUD-04, BUD-05, BUD-13", vec![]))
 }
 
 pub async fn get_handler(
@@ -444,6 +667,12 @@ pub async fn get_handler(
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("GET {path} | {}", get_user_agent(&headers));
+
+    if matches!(path.as_str(), "upload" | "media" | "mirror") {
+        return Ok(make_method_not_allowed_response(
+            methods_for_single_segment_path(&path)?,
+        ));
+    }
     
     let rec = extract_blob_record(&state, &path).await?;
 
@@ -517,6 +746,12 @@ pub async fn delete_handler(
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("DELETE {path} | {}", get_user_agent(&headers));
+
+    if matches!(path.as_str(), "upload" | "media" | "mirror") {
+        return Ok(make_method_not_allowed_response(
+            methods_for_single_segment_path(&path)?,
+        ));
+    }
     
     let sha256 = parse_sha256_from_path(path.as_str())?;
 
@@ -597,6 +832,7 @@ pub async fn put_handler(
     Extension(config): Extension<Config>,
     Extension(state): Extension<State>,
     Path(path): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     data: Bytes
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
     log!("PUT {path}: got {} bytes | {}", data.len(), get_user_agent(&headers));
@@ -661,7 +897,60 @@ pub async fn put_handler(
         dbg!(&res);
         Ok(res)
     } else {
-        Err((StatusCode::NOT_FOUND, "not found".to_string()))
+        let expected_sha256 = parse_bud13_sha256_path(&path)?;
+        validate_bud13_query(&params)?;
+
+        let e = check_action(&headers, "upload", Some(expected_sha256.clone())).map_err(
+            |(status, reason)| {
+                if status == StatusCode::BAD_REQUEST {
+                    (StatusCode::UNAUTHORIZED, reason)
+                } else {
+                    (status, reason)
+                }
+            },
+        )?;
+        let data = data.to_vec();
+        let actual_sha256 = get_sha256(&data)
+            .await
+            .map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "sha256 error".to_string()))?;
+        if actual_sha256 != expected_sha256 {
+            return Err((
+                StatusCode::CONFLICT,
+                "sha256 path does not match request body".to_string(),
+            ));
+        }
+
+        let already_exists = find_blob(&state, expected_sha256.clone()).await?.is_some();
+        log!("PUT {} pubkey: {}", path, e.pubkey.to_hex());
+        let (descriptor, blossom_url) = import_blob(&e, &data, &config, &state)
+            .await
+            .map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "blob import error".to_string()))?;
+
+        #[cfg(feature = "media-processing")]
+        {
+            let _nid = schedule_media_processing(
+                &config,
+                &state,
+                e.pubkey,
+                data,
+                expected_sha256,
+                blossom_url,
+            )
+            .await
+            .map_log_err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "scheduling media processing failed".to_string(),
+            ))?;
+        }
+
+        Ok(make_response(
+            bud13_upload_status(already_exists),
+            "application/json",
+            serde_json::to_string(&descriptor)
+                .map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?
+                .as_str(),
+            vec![],
+        ))
     }
 }
 

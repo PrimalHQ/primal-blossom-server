@@ -16,10 +16,12 @@ async fn main() -> anyhow::Result<()> {
 use primal_blossom_server::{
     log,
     get,
-    put,
     options,
     welcome_page_handler,
     options_handler,
+    list_options_handler,
+    method_not_allowed_handler,
+    list_method_not_allowed_handler,
     head_handler,
     get_handler,
     put_handler,
@@ -68,9 +70,16 @@ async fn my_main(config: Config, state: State, cli: Cli) -> anyhow::Result<()> {
 
             let app = Router::new()
                 .route("/", get(welcome_page_handler))
-                .route("/:path", options(options_handler).head(head_handler).get(get_handler).delete(delete_handler))
-                .route("/:path", put(put_handler).layer(DefaultBodyLimit::max(10*1024*1024*1024)))
-                .route("/list/:path", options(options_handler).head(head_handler).get(get_list_handler))
+                .route("/:path", options(options_handler)
+                    .head(head_handler)
+                    .get(get_handler)
+                    .delete(delete_handler)
+                    .put(put_handler)
+                    .fallback(method_not_allowed_handler)
+                    .layer(DefaultBodyLimit::max(10*1024*1024*1024)))
+                .route("/list/:path", options(list_options_handler)
+                    .get(get_list_handler)
+                    .fallback(list_method_not_allowed_handler))
                 .layer(Extension(config))
                 .layer(Extension(state))
                 // .layer(TraceLayer::new_for_http()
@@ -121,4 +130,3 @@ async fn my_main(config: Config, state: State, cli: Cli) -> anyhow::Result<()> {
         }
     }
 }
-
