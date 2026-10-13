@@ -131,6 +131,10 @@ pub struct Config {
     pub local_storages: HashMap<String, String>,
     pub sandboxing: bool,
     pub tempdir: String,
+    // Log every read request (OPTIONS, HEAD, GET, list) with its user agent. Off by default: at
+    // production traffic that is ~2 GB of log a day; uploads, deletes and errors are always logged.
+    #[serde(default)]
+    pub log_reads: bool,
     // SSH fallback: when a host-local file is missing from local disk, pull it from
     // this host via `ssh <host> cat <remote_base><relpath>`, verify sha256, and stream it.
     // Disabled unless both host and remote_base are set.
@@ -367,11 +371,11 @@ pub fn get_user_agent(headers: &axum::http::HeaderMap) -> String {
 
 pub async fn options_handler(
     headers: axum::http::HeaderMap,
-    Extension(_config): Extension<Config>,
+    Extension(config): Extension<Config>,
     Extension(_state): Extension<State>,
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
-    log!("OPTIONS {path} | {}", get_user_agent(&headers));
+    if config.log_reads { log!("OPTIONS {path} | {}", get_user_agent(&headers)); }
     Ok(make_response(StatusCode::OK, "text/plain", "ok", vec![
         ("Access-Control-Allow-Headers", "Authorization, *"),
         ("Access-Control-Allow-Methods", "GET, PUT, DELETE"),
@@ -380,11 +384,11 @@ pub async fn options_handler(
 
 pub async fn head_handler(
     headers: axum::http::HeaderMap,
-    Extension(_config): Extension<Config>,
+    Extension(config): Extension<Config>,
     Extension(state): Extension<State>,
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
-    log!("HEAD {path} | {}", get_user_agent(&headers));
+    if config.log_reads { log!("HEAD {path} | {}", get_user_agent(&headers)); }
     
     if path == "upload" || path == "media" {
         #[cfg(not(feature = "media-processing"))]
@@ -416,10 +420,10 @@ pub async fn head_handler(
 
 pub async fn welcome_page_handler(
     headers: axum::http::HeaderMap,
-    Extension(_config): Extension<Config>,
+    Extension(config): Extension<Config>,
     Extension(_state): Extension<State>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
-    log!("GET / | {}", get_user_agent(&headers));
+    if config.log_reads { log!("GET / | {}", get_user_agent(&headers)); }
     Ok(make_response(StatusCode::OK, "text/plain", "Welcome to Primal Blossom server. Implemented: BUD-01, BUD-02, BUD-04, BUD-05", vec![]))
 }
 
@@ -429,7 +433,7 @@ pub async fn get_handler(
     Extension(state): Extension<State>,
     Path(path): Path<String>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
-    log!("GET {path} | {}", get_user_agent(&headers));
+    if config.log_reads { log!("GET {path} | {}", get_user_agent(&headers)); }
 
     let sha256 = parse_sha256_from_path(&path)?;
     let rec = extract_blob_record(&state, &path).await?;
@@ -491,7 +495,7 @@ pub async fn get_list_handler(
     Path(path): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<axum::body::Body>, (StatusCode, String)> {
-    log!("GET /list/{path} | {}", get_user_agent(&headers));
+    if config.log_reads { log!("GET /list/{path} | {}", get_user_agent(&headers)); }
     
     let pk = PublicKey::parse(&path).map_log_err((StatusCode::BAD_REQUEST, "invalid pubkey".to_string()))?;
     let e = check_action(&headers, "list", None, &state).await?;
@@ -737,7 +741,6 @@ pub async fn put_handler_(
         let res = (make_response(StatusCode::OK, "application/json", 
                 serde_json::to_string(&r).map_log_err((StatusCode::INTERNAL_SERVER_ERROR, "json error".to_string()))?.as_str(), 
                 vec![]), e);
-        dbg!(&res);
         Ok(res)
     } else {
         Err((StatusCode::NOT_FOUND, "not found".to_string()))
@@ -1108,7 +1111,6 @@ impl TempFile {
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        eprintln!("TempFile dropped: {}", self.path);
         if std::path::Path::new(&self.path).exists() {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -1342,7 +1344,6 @@ pub async fn schedule_processing_node(
     kwargs: Value,
 ) -> Result<Vec<u8>, String> {
     let id_str = json!({"mod": module, "func": func, "args": args, "kwargs": kwargs}).to_string();
-    dbg!(&id_str);
     let id_data = id_str.as_bytes().to_vec();
     let id = sha2::Sha256::digest(&id_data).to_vec();
 
@@ -1447,7 +1448,6 @@ async fn insert_log(
     tag: &str,
     data: &Value,
 ) -> anyhow::Result<()> {
-    dbg!(&data);
     if let Some(log_pool) = &state.log_pool {
         let r = sqlx::query(
             r#"
