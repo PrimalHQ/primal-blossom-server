@@ -50,5 +50,4 @@ nix develop --command sh -c \
    ./target/release/primal_blossom_server --config-file primal-blossom-server-config.json serve'
 ```
 
-See `primal-blossom-server-config.json.sample` for config fields and `run.sh` for the
-watch-and-restart wrapper used in development.
+See `primal-blossom-server-config.json.sample` for config fields.
